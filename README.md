@@ -1,372 +1,104 @@
 # distributedLocks
 
-本项目使用各种方式实现分布式锁，目前已实现zookeeper自己api的分布式锁，后面陆续会出rzookeeper的分布式锁Curator实现，redis分布式锁等。
 
-## 什么是分布式锁
 
-一个很典型的秒杀场景，或者说并发量非常高的场景下，对商品库存的操作，我用一个SpringBoot小项目模拟一下。
+## 0x01 什么是分布式锁
 
-用到的知识架构：
+当**多个进程**在同一个系统中，用分布式锁控制多个进程对资源的访问
 
-- **SpringBoot**
-- **Redis**
-- **ZooKeeper**
 
-我提前将库存**stock**放在redis，初始值为288：
 
-```sh
-127.0.0.1:6379> set stock 288
-OK
-127.0.0.1:6379> get stock
-"288"
-```
+## 0x02 **分布式锁应用场景**
 
-扣减库存的api：
+（1）传统的单体应用单机部署情况下，可以使用java并发处理相关的API进行互斥控制。
 
-```java
-@RequestMapping("/v1/reduce")
-public String reduceStock() {
-    String stockStr = redisTemplate.opsForValue().get("stock");
-    int stock = Integer.parseInt(stockStr);
-    if (stock > 0) {
-        int realStock = stock - 1;
-        redisTemplate.opsForValue().set("stock", String.valueOf(realStock));
-        System.out.println(Thread.currentThread().getName() + " 减库存成功，剩余库存：" + realStock);
-    } else {
-        System.out.println("不能再减了，没有库存了！");
-    }
-    return port + ": reduce stock end";
-}
-```
+（2）分布式系统后由于多线程，多进程分布在不同机器上，使单机部署情况下的并发控制锁策略失效，为了解决跨JVM互斥机制来控制共享资源的访问，这就是分布式锁的来源；分布式锁应用场景大都是高并发、大流量场景。
 
-单机环境下的高并发：
 
-![单机环境下的高并发](https://imgkr2.cn-bj.ufileos.com/e5406c21-ba65-4dca-ac04-4842bf916cff.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=l2Ty3wxBg40oZfD7C2Exh3Qn8fY%253D&Expires=1600517702)
 
+## 0x03 基于etcd分布式锁的实现
 
-   我用**Apache JMeter**模拟在同一时刻，有500个请求打到`/stock/v1/reduce`上进行减库存的操作：
+### 3.1 etcd分布式锁实现的基础机制
 
-   ![](https://imgkr2.cn-bj.ufileos.com/66332369-bf31-4f69-a922-0568472f90f0.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=sCTT4Tek97xptlMQQHmnrARkF4g%253D&Expires=1600517727)
+### Lease机制
 
+租约机制（**TTL**，Time To Live），etcd 可以为存储的 **key-value** 对设置租约，**当租约到期，key-value 将失效删除**；
 
-   ![](https://imgkr2.cn-bj.ufileos.com/5cd4602c-10a1-4147-8868-efa906ea7494.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=OpddbSBhNF%252BeK%252Bm15q15rJVzeYQ%253D&Expires=1600517745)
+同时也支持**续约**，通过客户端可以在租约到期之前续约，
+以避免 **key-value** 对过期失效。
 
+Lease 机制可以**保证分布式锁的安全性**，为锁对应的 key 配置租约，
+**即使锁的持有者因故障而不能主动释放锁，锁也会因租约到期而自动释放**。
 
-   > Apache JMeter是Apache组织开发的基于Java的压力测试工具。用它很容易模拟出高并发场景。
-   >
-   > Apache JMeter官网：http://jmeter.apache.org/download_jmeter.cgi
+### Revision机制
 
-   启动SpringBoot项目，执行压测，运行结果：
+每个 key 带有一个 Revision 号，每进行一次事务便+1，它是全局唯一的，
+通过 Revision 的大小就可以知道进行写操作的顺序。
 
-   ![](https://imgkr2.cn-bj.ufileos.com/76d55c3a-5651-4c70-b6e8-5d9948c48691.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=7SNksm3rAREDH1%252FYFumXw2JrGxU%253D&Expires=1600517781)
+在实现分布式锁时，多个客户端同时抢锁，
+根据 Revision 号大小依次获得锁，可以避免 “羊群效应” ，实现**公平锁**。
 
+> 羊群效应：羊群是一种很散乱的组织，平时在一起也是盲目地左冲右撞，但一旦有一只头羊动起来，其他的羊也会不假思索地一哄而上，全然不顾旁边可能有的狼和不远处更好的草。
+>
+> etcd的Revision机制，可以根据Revision号的大小顺序进行写操作，因而可以避免“羊群效应”。
+>
+> 这根zookeeper的临时顺序节点+监听机制可以避免羊群效应的原理是一致的。
 
-   500个并发，才扣减了5个！！！BOSS该找你事了！
+### Prefix机制
 
-   不过这种情况我们程序员是不会让它出现的，加个**synchronized**，让每个线程拿到锁之后再去扣减库存：
+即前缀机制。
 
-   ![单机环境下加synchronized解决线程安全](https://imgkr2.cn-bj.ufileos.com/128536aa-87e7-4dfa-a6e3-79a3dbcd6063.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=vqQcVjC2c6TWwTc9YK5J9cMkOm8%253D&Expires=1600517803)
+例如，一个名为 /etcd/lock 的锁，两个争抢它的客户端进行写操作，
+实际写入的 key 分别为：key1="/etcd/lock/UUID1"，key2="/etcd/lock/UUID2"。
 
+其中，UUID 表示全局唯一的 ID，确保两个 key 的唯一性。
 
-   代码实现：
+写操作都会成功，但返回的 Revision 不一样，
+那么，如何判断谁获得了锁呢？通过前缀 /etcd/lock 查询，返回包含两个 key-value 对的的 KeyValue 列表，
+同时也包含它们的 Revision，通过 Revision 大小，客户端可以判断自己是否获得锁。
 
-```java
-   @RequestMapping("/v2/reduce")
-   public String reduceStockV2() {
-       //加线程同步
-       synchronized (this) {
-           String stockStr = redisTemplate.opsForValue().get("stock");
-           int stock = Integer.parseInt(stockStr);
-           if (stock > 0) {
-               int realStock = stock - 1;
-               redisTemplate.opsForValue().set("stock", String.valueOf(realStock));
-               System.out.println(Thread.currentThread().getName() + " 减库存成功，剩余库存：" + realStock);
-           } else {
-               System.out.println("不能再减了，没有库存了！");
-           }
-       }
-       return port + ": reduce stock end";
-   }
-```
+### Watch机制
 
-   压测结果：
+即监听机制。
 
-   ![](https://imgkr2.cn-bj.ufileos.com/d1046208-7f05-40eb-acd9-efa61ad3b370.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=wqpK%252BJMT1vk3PSOPVIWIQoRy9Vc%253D&Expires=1600517836)
+Watch 机制支持 Watch 某个固定的 key，也支持 Watch 一个范围（前缀机制）。
 
+当被 Watch 的 key 或范围发生变化，客户端将收到通知；在实现分布式锁时，如果抢锁失败，可通过 Prefix 机制返回的 Key-Value 列表获得 Revision 比自己小且相差最小的 key（称为 pre-key），对 pre-key 进行监听，因为只有它释放锁，自己才能获得锁，如果 Watch 到 pre-key 的 DELETE 事件，则说明 pre-key 已经释放，自己将持有锁。
 
-   **synchronized**只能帮我们解决单进程内的线程安全问题，而事实上，在分布式环境下，我们一个服务，比如这个扣减库存的服务，可能存在于多个服务器（多个tomcat进程）中，再使用synchronized就无法解决分布式服务下的高并发问题了。
+### 3.2 etcd分布式锁原理图
 
-   我们来模拟一下分布式环境下的高并发问题，我本地开启两个扣减库存的服务，一个8080端口，一个8090端口，使用Nginx作反向代理：
+![etcd分布式锁实现原理](6886CD65E9DD40998D3A4730DF7A409B)
 
-   ![使用nginx作反向代理](https://imgkr2.cn-bj.ufileos.com/806c9ebc-709e-4f9a-889f-d3d601720fa1.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=byp91zDY%252BMdEjulQhc1DAvZLd%252Fg%253D&Expires=1600517862)
+### 3.3 etcd分布式锁的实现流程
+1. 建立连接
 
+客户端连接 etcd，以 /etcd/lock 为前缀创建全局唯一的 key，假设第一个客户端对应的 key="/etcd/lock/UUID1"，第二个为key="/etcd/lock/UUID2"；客户端分别为自己的 key 创建租约 - Lease，租约的长度根据业务耗时确定；
 
-   我的Nginx服务器的IP地址为 `192.168.134.135`，开启**200个线程**，**循环4次**，相当于一共有**800**次访问 `http://192.168.134.135/stock/v2/reduce`，如此就可以模拟出分布式下的高并发场景了。
+2. 创建定时任务作为租约的“心跳”
 
-   ![](https://imgkr2.cn-bj.ufileos.com/ed1d1b49-04b8-418f-bca7-83e85329cbeb.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=dpOHdIiP4hAXyPaULFwVhZWHWTo%253D&Expires=1600517915)
+当一个客户端持有锁期间，其它客户端只能等待，为了避免等待期间租约失效，客户端需创建一个定时任务作为“心跳”进行续约。
 
+此外，如果持有锁期间客户端崩溃，心跳停止，key 将因租约到期而被删除，从而锁释放，避免死锁；
 
-   开始压测：
+3. 客户端将自己全局唯一的 key 写入 etcd
 
-   ![](https://imgkr2.cn-bj.ufileos.com/abb918c5-474b-4472-8384-50a9c08644c1.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=l46unZYWC1FB003bgbd6JzldbFA%253D&Expires=1600517937)
+执行 put 操作，将步骤 1 中创建的 key 绑定租约写入 Etcd，根据 Etcd 的 Revision 机制，假设两个客户端 put 操作返回的 Revision 分别为 1、2，客户端需记录 Revision 用以接下来判断自己是否获得锁；
 
+4. 客户端判断是否获得锁
 
-   压测结果：
+客户端以前缀 /etcd/lock/ 读取 key-Value 列表，判断自己 key 的 Revision 是否为当前列表中最小的，如果是则认为获得锁；否则监听列表中前一个 Revision 比自己小的 key 的删除事件，一旦监听到删除事件或者因租约失效而删除的事件，则自己获得锁；
 
-   服务1：
+5. 执行业务
 
-   ![8080服务运行结果](https://imgkr2.cn-bj.ufileos.com/e3f8aecb-4fb7-40b6-a356-a7c6b7424f53.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=VtPhpWeASKer3%252FN7G0AGDh0iSA4%253D&Expires=1600517964)
+获得锁后，操作共享资源，执行业务代码
 
+6. 释放锁
 
-   服务2：
+完成业务流程后，删除对应的key释放锁
 
-   ![](https://imgkr2.cn-bj.ufileos.com/d2e6cad0-5c60-4fa2-a488-1550aad8efc0.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=nhZFNZ5UjIVWVg4Qz4I%252Biil%252BKB8%253D&Expires=1600517986)
+## 0x04 基于ZooKeeper分布式锁的实现
 
+## 0x05 基于Redis分布式锁的实现
 
-   发现**synchronized**根本没用，很多线程还是重复扣减了库存！！！
+## 0x06 基于MySQL分布式锁的实现
 
-   这种时候就需要**分布式锁**来解决这个问题了。
-
-
-## 使用ZooKeeper实现分布式锁
-
-   > 本案例采用zk自己的api实现分布式锁。当然还可以使用第三方提供的api实现zk分布式锁，比如`Curator`（现在Curator也归属于Apache了）。
-   >
-   > Curator官网：http://curator.apache.org/
-   >
-   > 后续会考虑出一个Curator版本的zk分布式锁的实现。本文提供的方式掌握了，其他版本就不在话下了，哈哈！
-
-   为什么zk能实现分布式锁呢？我们之前已经了解过zk拥有类似于Linux文件系统的数据结构，还有一套事件监听机制。
-
-   ![ZooKeeper数据结构](https://imgkr2.cn-bj.ufileos.com/2348d0f7-3380-4c92-ab11-f3cc5e61d7c5.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=svt3kTuJZmwTpqXcP%252F6i0d5i%252Bhg%253D&Expires=1600518017)
-
-
-   zk的数据结构中，每个节点还可以存数据，这个就比较厉害了。还可以创建顺序节点，节点带编号。临时节点还有随session存在而存在的特性，所以当客户端失去连接的时候session消亡，临时节点也就消失了。
-
-   还有，zk的事件监听机制。zk上所有的节点，持久节点，顺序节点，临时顺序节点等都可以对它进行监听，当某一个节点上发生了变化，比如当节点被创建了、数据更新、**节点被删除**等，这些**事件都会被监听**到，同时**触发回调**，那么我们在代码中就能够做一些相应的处理。
-
-   ![](https://imgkr2.cn-bj.ufileos.com/98db87b3-b39c-4bc0-aeb7-71ef6c18430f.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=gcSDsc8L%252B5qEWoDqJxNH2r1L1ig%253D&Expires=1600518045)
-
-
-   这里其实有个问题，如果我们只关注`/lock`节点的话，并发量一高会带来通信压力，因为很多client都watch了`/lock`节点，当`/lock`节点发生变化，这些client一窝蜂的进行事件回调争抢锁，压力就出现了。zk的临时顺序节点能帮我们解决这个问题，我们只监听顺序节点的前一个节点，看它是不是顺序最小的，让顺序最小的获得锁！
-
-   ![只监听前一个节点防止羊群效应](https://imgkr2.cn-bj.ufileos.com/ca1451f8-805a-4ab8-8f92-568eab485c61.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=EhHSNQwO47PWdI09xAGCETaZ8fo%253D&Expires=1600518073)
-
-
-   因此，基于zk的**临时顺序节点**和**事件监听**，我们就可以实现**分布式锁**。
-
-   
-
-## 代码实现
-
-   总体框架，三大步：
-
-   1. 争抢锁
-   2. 做自己爱做的事情
-   3. 释放锁
-
-   先把这个架子搭起来：
-
-```java
-   @RequestMapping("/v3/reduce")
-   public String reduceStockV3() {
-       try {
-           //1. 抢锁
-           tryLock
-           //2. 做自己爱做的事
-           //比如减库存
-           //3. 释放锁
-           releaseLock
-       } catch (Exception e) {
-           e.printStackTrace();
-       }
-       return port + ": reduce stock end";
-   }
-```
-
-   > zk API的响应式编程很爽，我在 [zookeeper实现分布式配置](http://mp.weixin.qq.com/s?__biz=MzI1MDU1MjkxOQ==&mid=100001512&idx=1&sn=7f3d5efdcaaf4b5d3aa3867b79f686de&chksm=698131d05ef6b8c605d3fe8237bc94c0db18b51eac0f5d4076726677d065333a37460aa1d7ef#rd) 这篇文章里就是用的是响应式编程。
-   >
-   > 响应式编程很好理解，就是对事件加监听，当完成某个事件的时候，就出发相应的回调函数，zk的很多api都提供了方法的异步调用版本。
-
-   前文分析，实现分布式锁的流程是：抢锁就是创建临时有序节点，监听创建成功后，获取根节点（连接zk集群时候的根节点）下的所有孩子节点，然后比较当前节点时候为第一个（要排好序），若是第一个，则抢锁成功，做自己的业务，然后释放锁-删除节点，当然删除节点也会触发回调。
-
-   因此，核心代码逻辑都在监听回调里，抽象出一个WatchAndCallback出来：
-
-```java
-   public class WatchAndCallback implements Watcher, AsyncCallback.StringCallback, AsyncCallback.Children2Callback, AsyncCallback.StatCallback {
-   
-       //肯定得有zookeeper
-       private final ZooKeeper zk;
-       //创建的节点名称，节点监听它的前一个顺序节点时需要用到
-       private String pathName;
-       //也得有CountDownLatch，用来保证程序阻塞与继续执行
-       private final CountDownLatch latch = new CountDownLatch(1);
-   
-       //线程名称，辅助观察
-       private final String threadName;
-   
-       public WatchAndCallback(ZooKeeper zk, String threadName) {
-           this.zk = zk;
-           this.threadName = threadName;
-       }
-   
-       //Children2Callback
-       //此回调用于检索节点的子节点和stat
-       //处理异步调用的结果
-       // List<String> children 给定路径上节点的子节点的无序数组，基于watch前一个节点，最小节点获得锁的机制，需要给children排个序
-       @Override
-       public void processResult(int rc, String path, Object ctx, List<String> children, Stat stat) {
-           //实现分布式锁的核心
-           
-       }
-   
-       //StatCallback
-   //    处理异步调用的结果
-   //    成功, rc is KeeperException.Code.OK.
-   //    失败, rc is set to the corresponding failure code in KeeperException.
-       @Override
-       public void processResult(int rc, String path, Object ctx, Stat stat) {
-           //TODO
-       }
-   
-       //创建节点时的回调 StringCallback
-       //此回调用于检索节点的名称
-       // name: 创建的znode的名称。如果成功，名称和路径通常相等，除非创建了顺序节点。
-       @Override
-       public void processResult(int rc, String path, Object ctx, String name) {
-           
-       }
-   
-       //Watcher
-       //如果某个线程释放锁了，也就是节点被删除了，也要触发监听
-       //如果不是释放锁而是某个节点本身出问题了，zk也会删除node，也需要一个监听
-       @Override
-       public void process(WatchedEvent watchedEvent) {
-           
-       }
-   }
-```
-
-   我把分布式锁的代码逻辑都放在WatchAndCallback类中。
-
-   1. 抢锁，tryLock
-
-```java
-   /**
-    * 抢锁---zk节点具有互斥性，当已存在该节点时会创建失败，所以创建临时节点可以知道是否抢锁成功
-    * @author 行百里者
-    * @create 2020/9/18 15:37
-    **/
-   public void tryLock() {
-       System.out.println(threadName + " 试图抢锁");
-       //创建临时序列节点，data就设置为当前线程名字即可，实际业务可设置为用户id
-       //创建节点也有callback，传一个this即可，会触发调用processResult(int rc, String path, Object ctx, String name)
-       zk.create("/stock",
-               threadName.getBytes(),
-               ZooDefs.Ids.OPEN_ACL_UNSAFE,
-               CreateMode.EPHEMERAL_SEQUENTIAL,
-               this,
-               "create node ctx");
-       //异步的，要await一下
-       try {
-           latch.await();
-       } catch (InterruptedException e) {
-           e.printStackTrace();
-       }
-   }
-```
-
-   2. 减库存，保存lucky（实际场景中的订单信息）
-
-   在controller中，也就是说当一个客户抢锁成功，就要对数据做相应的改变：
-
-```java
-   //2. 做自己爱做的事
-   int stock = Integer.parseInt(redisTemplate.opsForValue().get("stock"));
-   if (stock > 0) {
-       int realStock = stock - 1;
-       redisTemplate.opsForValue().set("stock", String.valueOf(realStock));
-       //同时lucky+1
-       redisTemplate.opsForValue().increment("lucky");
-   } else {
-       System.out.println("库存不足");
-   }
-```
-
-   3. 给别人机会，释放锁，releaseLock
-
-
-```java
-   //也就是删除临时节点
-   public void releaseLock() {
-       try {
-           zk.delete(pathName, -1);
-           System.out.println(threadName + " 流程走完了，释放锁");
-       } catch (InterruptedException e) {
-           e.printStackTrace();
-       } catch (KeeperException e) {
-           e.printStackTrace();
-       }
-   }
-```
-
-## 压力测试
-
-   还是用JMeter模拟高并发场景，一次并发800个请求打到nginx上，nginx反向代理到两个tomcat。
-
-   首先开启两个tomcat：
-
-   ![](https://imgkr2.cn-bj.ufileos.com/d29adff1-d39a-4e3c-88fa-203e6a09bf4e.png?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=V3omN48xr8uxOPrUUXSqC6y7aHY%253D&Expires=1600518130)
-
-
-   初始化库存仍设置为288（redis），同时在设置一个`lucky`，表示有多少人抢到了库存中的数据，这个数据最终为288才是正确的：
-
-```sh
-   127.0.0.1:6379> set stock 288
-   OK
-   127.0.0.1:6379> get stock
-   "288"
-   127.0.0.1:6379> set lucky 0
-   OK
-   127.0.0.1:6379> get lucky
-   "0"
-```
-
-   初始化zk lock根节点：
-
-```sh
-   [zk: localhost:2181(CONNECTED) 5] ls /lock
-   []
-```
-
-   压力测试：
-
-   ![高并发下zk分布式锁压测](https://imgkr2.cn-bj.ufileos.com/ecb7d91f-47ad-4193-b19f-2818dd394a44.gif?UCloudPublicKey=TOKEN_8d8b72be-579a-4e83-bfd0-5f6ce1546f13&Signature=fvd3zgaZ%252BigJqCpDsZGGxh7HIGw%253D&Expires=1600518162)
-
-
-   看一下后台redis中存储的stock和lucky数据：
-
-```sh
-   127.0.0.1:6379> get stock
-   "0"
-   127.0.0.1:6379> get lucky
-   "288"
-   127.0.0.1:6379> 
-```
-
-   stock为0说明没有超卖，lucky=288说明也没有同一个库存扣减多次的情况。
-
-   ok，zk实现分布式锁就是这么完美！
-
-
-## 小结
-
-   zk实现分布式锁：
-
-   1. 争抢锁，只有一个能获得锁
-   2. 获得锁的人，如果故障了，死锁->用zookeeper，zk的特征，创建临时节点，产生一个session，它如果挂了，session会消失，释放锁->zk能回避死锁
-   3. 获得锁的人成功了，释放锁
-   4. 锁被释放/删除，别人怎么知道？
-      - 方式1：for循环，主动轮询，心跳 --> 弊端：延迟（实时性不强），压力（服务很多，都去轮询访问某一把锁）
-      - 方式2：watch 解决延迟问题 --> 弊端：通信压力（watch完了很多服务器回调去抢锁）
-      - 方式3：**临时顺序节点**+**事件监听机制**（序列节点+watch） watch谁？watch前一个，最小的获得锁，一旦最小的释放锁，成本是zk只给第二个node发事件回调   

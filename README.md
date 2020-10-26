@@ -67,7 +67,7 @@ Watch 机制支持 Watch 某个固定的 key，也支持 Watch 一个范围（�
 
 ### 3.2 etcd分布式锁原理图
 
-![etcd分布式锁实现原理](6886CD65E9DD40998D3A4730DF7A409B)
+![etcd分布式锁实现原理](//p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/838d3a78acb54b87a35eb6cd7bb3681a~tplv-k3u1fbpfcp-zoom-1.image)
 
 ### 3.3 etcd分布式锁的实现流程
 1. 建立连接

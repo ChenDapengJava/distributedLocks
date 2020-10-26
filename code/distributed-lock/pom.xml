@@ -5,6 +5,7 @@
     <modules>
         <module>base-lock</module>
         <module>etcd-lock</module>
+        <module>redis-lock</module>
     </modules>
     <parent>
         <groupId>org.springframework.boot</groupId>
